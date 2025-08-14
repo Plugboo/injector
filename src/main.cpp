@@ -25,6 +25,12 @@ wchar_t* char_to_wchar(const char* c)
     return wc;
 }
 
+void wait_exit(const int code)
+{
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    exit(code);
+}
+
 bool check_file_description(const char* buf, const char* module_path)
 {
     struct LANGANDCODEPAGE {
@@ -38,7 +44,7 @@ bool check_file_description(const char* buf, const char* module_path)
 
     if (!VerQueryValueA(buf, "\\VarFileInfo\\Translation", (void**)&translate_query, &query_size)) {
         std::cerr << "ERROR: File information query failed" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     // Look for the 3DMigoto file description in all language blocks... We
@@ -53,12 +59,12 @@ bool check_file_description(const char* buf, const char* module_path)
 
         if (FAILED(hr)) {
             std::cerr << "ERROR: File description query bugged" << std::endl;
-            exit(EXIT_FAILURE);
+            wait_exit(EXIT_FAILURE);
         }
 
         if (!VerQueryValueA(buf, id, reinterpret_cast<void**>(&file_description), &file_desc_size)) {
             std::cerr << "ERROR: File description query failed" << std::endl;
-            exit(EXIT_FAILURE);
+            wait_exit(EXIT_FAILURE);
         }
 
         // Only look for the 3Dmigoto prefix. We've had a whitespace
@@ -81,24 +87,24 @@ void check_3dmigoto_version(const char* module_path)
     unsigned int size = GetFileVersionInfoSizeA(module_path, &handle);
     if (!size) {
         std::cerr << "ERROR: Failed to get file version info size" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     const auto buffer = new char[size];
 
     if (!GetFileVersionInfoA(module_path, handle, size, buffer)) {
         std::cerr << "ERROR: Failed to get file version info" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     if (!check_file_description(buffer, module_path)) {
         std::cerr << "ERROR: The requested module is not 3DMigoto" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     if (!VerQueryValueA(buffer, "\\", reinterpret_cast<void**>(&query), &size)) {
         std::cerr << "ERROR: Failed to query 3DMigoto version" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     const auto major = query->dwProductVersionMS >> 16;
@@ -109,7 +115,7 @@ void check_3dmigoto_version(const char* module_path)
 
     if (query->dwProductVersionMS < 0x00010003 || query->dwProductVersionMS == 0x00010003 && query->dwProductVersionLS < 0x000f0000) {
         std::cerr << "ERROR: This version of 3DMigoto is too old to be safely loaded - please use 1.3.15 or later" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     delete[] buffer;
@@ -119,32 +125,32 @@ void validate_options(const lyra::cli& cli, const int argc, char** argv, const O
 {
     if (const auto result = cli.parse({ argc, argv }); !result) {
         std::cerr << "ERROR: " << result.message() << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     if (options.module.empty()) {
         std::cerr << "ERROR: You must specify a module" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     if (options.target.empty()) {
         std::cerr << "ERROR: You must specify a target" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     if (!std::filesystem::exists(options.module)) {
         std::cerr << "ERROR: Module does not exist" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     if (options.delay < 0) {
         std::cerr << "ERROR: Delay must be greater than or equal to 0" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     if (options.close < 0) {
         std::cerr << "ERROR: Close timer must be greater than or equal to 0" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 }
 
@@ -153,13 +159,13 @@ void setup_hook(const HMODULE module, const LPCSTR func_name, const int hook_id,
     const auto hook_func = GetProcAddress(module, func_name);
     if (hook_func == nullptr) {
         std::cerr << "ERROR: Failed to get hook function" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     const auto hook = SetWindowsHookEx(hook_id, reinterpret_cast<HOOKPROC>(hook_func), module, 0);
     if (hook == nullptr) {
         std::cerr << "ERROR: Failed to set hook" << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     out_hook = hook;
@@ -207,7 +213,7 @@ void load_module(const std::string& module_path, HMODULE& out_module)
     if (module == nullptr) {
         const auto error = GetLastError();
         std::cerr << "ERROR: Failed to load module " << module_path << ": " << error << std::endl;
-        exit(EXIT_FAILURE);
+        wait_exit(EXIT_FAILURE);
     }
 
     out_module = module;
@@ -248,6 +254,58 @@ bool find_process(const std::string& process_name, PROCESSENTRY32& out_process)
     return false;
 }
 
+void elevate_privileges(int argc, char** argv)
+{
+    DWORD size = sizeof(TOKEN_ELEVATION);
+    TOKEN_ELEVATION Elevation;
+    wchar_t path[MAX_PATH];
+    HANDLE token = nullptr;
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return;
+
+    if (!GetTokenInformation(token, TokenElevation, &Elevation, sizeof(Elevation), &size)) {
+        CloseHandle(token);
+        return;
+    }
+
+    CloseHandle(token);
+
+    if (Elevation.TokenIsElevated)
+        return;
+
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH))
+        return;
+
+    std::string parameters;
+    for (int i = 1; i < argc; i++) {
+        if (auto arg = std::string(argv[i]); arg.find(' ') != std::string::npos) {
+            parameters += "\"" + arg + "\"" + " ";
+        } else {
+            parameters += arg + " ";
+        }
+    }
+
+    const auto charPar = char_to_wchar(parameters.c_str());
+
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    int rc = static_cast<int>(reinterpret_cast<uintptr_t>(ShellExecuteW(nullptr, L"runas", path, charPar, nullptr, SW_SHOWNORMAL)));
+    if (rc > 32) {
+        delete[] charPar;
+        exit(0);
+    }
+
+    delete[] charPar;
+
+    if (rc == SE_ERR_ACCESSDENIED) {
+        std::cerr << "ERROR: Access Denied" << std::endl;
+        wait_exit(EXIT_FAILURE);
+    }
+
+    std::cerr << "ERROR: Unable to run as admin: " << rc << std::endl;
+    wait_exit(EXIT_FAILURE);
+}
+
 int main(const int argc, char** argv)
 {
     Options options;
@@ -266,6 +324,8 @@ int main(const int argc, char** argv)
 
     validate_options(cli, argc, argv, options);
     check_3dmigoto_version(options.module.c_str());
+
+    elevate_privileges(argc, argv);
 
     HMODULE module;
     load_module(options.module, module);
